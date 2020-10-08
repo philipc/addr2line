@@ -12,7 +12,7 @@ use std::path::Path;
 
 use clap::{App, Arg, Values};
 use fallible_iterator::FallibleIterator;
-use object::Object;
+use object::{Object, ObjectSymbol};
 
 use addr2line::{Context, Location};
 
@@ -154,9 +154,42 @@ fn main() {
     let file = File::open(path).unwrap();
     let map = unsafe { memmap::Mmap::map(&file).unwrap() };
     let file = &object::File::parse(&*map).unwrap();
-
     let symbols = file.symbol_map();
-    let ctx = Context::new(file).unwrap();
+    let context = Context::new(file).unwrap();
+
+    let object_map = file.object_map();
+    let mut objects: Vec<_> = Vec::new();
+    fn split(path: &str) -> Option<(&str, &str)> {
+        let index = path.find('(')?;
+        let (archive, rest) = path.split_at(index);
+        let member = rest.strip_prefix('(')?.strip_suffix(')')?;
+        Some((archive, member))
+    };
+    for object_path in object_map.objects() {
+        if let Some((archive_path, member_name)) = split(object_path) {
+            let file = File::open(archive_path).unwrap();
+            let map = unsafe { memmap::Mmap::map(&file).unwrap() };
+            let archive = object::read::archive::ArchiveFile::parse(&*map).unwrap();
+            let mut members = archive.members();
+            // FIXME: handle case where member is not found
+            while let Ok(Some(member)) = members.next() {
+                if member.name() == member_name.as_bytes() {
+                    let file = object::File::parse(member.data()).unwrap();
+                    let file = unsafe { std::mem::transmute::<object::File<'_>, object::File<'static>>(file) };
+                    let context = Context::new(&file).unwrap();
+                    objects.push((map, file, context));
+                    break;
+                }
+            }
+        } else {
+            let file = File::open(object_path).unwrap();
+            let map = unsafe { memmap::Mmap::map(&file).unwrap() };
+            let file = object::File::parse(&*map).unwrap();
+            let file = unsafe { std::mem::transmute::<object::File<'_>, object::File<'static>>(file) };
+            let context = Context::new(&file).unwrap();
+            objects.push((map, file, context));
+        }
+    }
 
     let stdin = std::io::stdin();
     let addrs = matches
@@ -177,6 +210,19 @@ fn main() {
                 println!();
             }
         }
+
+        let mut probe = probe;
+        let mut ctx = &context;
+        if let Some(symbol) = object_map.get(probe) {
+            let (_, ref object, ref context) = objects[symbol.object_index()];
+            ctx = context;
+            for object_symbol in object.symbols() {
+                if Ok(symbol.name()) == object_symbol.name() {
+                    probe = probe - symbol.address() + object_symbol.address();
+                    break;
+                }
+            }
+        };
 
         if do_functions || do_inlines {
             let mut printed_anything = false;
@@ -211,7 +257,7 @@ fn main() {
 
             if !printed_anything {
                 if do_functions {
-                    if let Some(name) = symbols.get(probe).and_then(|x| x.name()) {
+                    if let Some(name) = symbols.get(probe).map(|x| x.name()) {
                         print_function(name, None, demangle);
                     } else {
                         print!("??");
