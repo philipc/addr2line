@@ -354,12 +354,8 @@ impl<R: gimli::Reader> Context<R> {
 
     /// Find the source file and line corresponding to the given virtual memory address.
     pub fn find_location(&self, probe: u64) -> Result<Option<Location<'_>>, Error> {
-        for unit in self.find_units(probe) {
-            if let Some(location) = unit.find_location(probe, &self.sections)? {
-                return Ok(Some(location));
-            }
-        }
-        Ok(None)
+        self.find_location_range(probe, probe + 1)
+            .map(|mut locs| locs.next().map(|(_, _, loc)| loc))
     }
 
     /// Return source file and lines for a range of addresses. For each location it also
@@ -368,17 +364,8 @@ impl<R: gimli::Reader> Context<R> {
         &self,
         probe_low: u64,
         probe_high: u64,
-    ) -> Result<impl Iterator<Item = (u64, u64, Location<'_>)>, Error> {
-        let iter = self
-            .find_units_range(probe_low, probe_high)
-            .flat_map(move |unit| {
-                unit.find_location_range(probe_low, probe_high, &self.sections)
-                    .ok()
-                    .into_iter()
-                    .flatten()
-            });
-
-        Ok(iter)
+    ) -> Result<LocationRangeIter<'_, R>, Error> {
+        LocationRangeIter::new(self, probe_low, probe_high)
     }
 
     /// Return an iterator for the function frames corresponding to the given virtual
@@ -579,74 +566,8 @@ where
         probe_low: u64,
         probe_high: u64,
         sections: &gimli::Dwarf<R>,
-    ) -> Result<impl Iterator<Item = (u64, u64, Location<'_>)>, Error> {
-        fn empty<'a, T: 'a>() -> Box<dyn Iterator<Item = T> + 'a> {
-            Box::new(iter::empty())
-        }
-
-        let lines = match self.parse_lines(sections)? {
-            Some(lines) => lines,
-            None => return Ok(empty()),
-        };
-
-        // Find index for probe_low.
-        let idx = lines.sequences.binary_search_by(|sequence| {
-            if probe_low < sequence.start {
-                Ordering::Greater
-            } else if probe_low >= sequence.end {
-                Ordering::Less
-            } else {
-                Ordering::Equal
-            }
-        });
-        let idx = match idx {
-            Ok(x) => x,
-            Err(0) => 0, // probe below sequence, but range could overlap
-            Err(_) => return Ok(empty()),
-        };
-        let sequences = &lines.sequences[idx..];
-
-        let locs = sequences
-            .into_iter()
-            .take_while(move |seq| seq.start < probe_high)
-            .flat_map(move |sequence| {
-                let idx = sequence
-                    .rows
-                    .binary_search_by(|row| row.address.cmp(&probe_low));
-                let idx = match idx {
-                    Ok(x) => x,
-                    Err(0) => 0, // probe below sequence, but range could overlap
-                    Err(x) => x - 1,
-                };
-                let rows = &sequence.rows[idx..];
-
-                rows.into_iter()
-                    .enumerate()
-                    .take_while(move |(_, row)| row.address < probe_high)
-                    .map(move |(idx, row)| {
-                        let file = lines.files.get(row.file_index as usize).map(String::as_str);
-                        let nextaddr = rows
-                            .get(idx + 1)
-                            .map(|row| row.address)
-                            .unwrap_or(sequence.end);
-
-                        (
-                            row.address,
-                            nextaddr - row.address,
-                            Location {
-                                file,
-                                line: if row.line != 0 { Some(row.line) } else { None },
-                                column: if row.column != 0 {
-                                    Some(row.column)
-                                } else {
-                                    None
-                                },
-                            },
-                        )
-                    })
-            });
-
-        Ok(Box::new(locs))
+    ) -> Result<LocationRangeUnitIter<'_>, Error> {
+        LocationRangeUnitIter::new(self, sections, probe_low, probe_high)
     }
 
     fn find_function_or_location(
@@ -708,6 +629,212 @@ where
         );
 
         Ok(path)
+    }
+}
+
+/// Iterator over `Location`s in a range of addresses, returned by `Context::find_location_range`.
+pub struct LocationRangeIter<'ctx, R: gimli::Reader> {
+    unit_iter: Box<dyn Iterator<Item = &'ctx ResUnit<R>> + 'ctx>,
+    iter: Option<LocationRangeUnitIter<'ctx>>,
+
+    probe_low: u64,
+    probe_high: u64,
+    sections: &'ctx gimli::Dwarf<R>,
+}
+
+impl<'ctx, R: gimli::Reader> LocationRangeIter<'ctx, R> {
+    fn new(ctx: &'ctx Context<R>, probe_low: u64, probe_high: u64) -> Result<Self, Error> {
+        let sections = &ctx.sections;
+        let mut unit_iter = ctx.find_units_range(probe_low, probe_high);
+        let iter = unit_iter
+            .next()
+            .map(|unit| unit.find_location_range(probe_low, probe_high, sections))
+            .transpose()?;
+
+        Ok(Self {
+            unit_iter: Box::new(unit_iter),
+            iter,
+            probe_low,
+            probe_high,
+            sections,
+        })
+    }
+
+    fn next_loc(&mut self) -> Result<Option<(u64, u64, Location<'ctx>)>, Error> {
+        loop {
+            let iter = self.iter.take();
+            match iter {
+                None => break,
+                Some(mut iter) => match iter.next() {
+                    item @ Some(_) => {
+                        self.iter = Some(iter);
+                        return Ok(item);
+                    }
+                    None => match self.unit_iter.next() {
+                        Some(unit) => {
+                            self.iter = Some(unit.find_location_range(
+                                self.probe_low,
+                                self.probe_high,
+                                self.sections,
+                            )?)
+                        }
+                        None => break,
+                    },
+                },
+            }
+            debug_assert!(self.iter.is_some());
+        }
+        Ok(None)
+    }
+}
+
+impl<'ctx, R> Iterator for LocationRangeIter<'ctx, R>
+where
+    R: gimli::Reader + 'ctx,
+{
+    type Item = (u64, u64, Location<'ctx>);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.next_loc() {
+            Err(_) => None,
+            Ok(loc) => loc,
+        }
+    }
+}
+
+#[cfg(feature = "fallible-iterator")]
+impl<'ctx, R> fallible_iterator::FallibleIterator for LocationRangeIter<'ctx, R>
+where
+    R: gimli::Reader + 'ctx,
+{
+    type Item = (u64, u64, Location<'ctx>);
+    type Error = Error;
+
+    #[inline]
+    fn next(&mut self) -> Result<Option<Self::Item>, Self::Error> {
+        self.next_loc()
+    }
+}
+
+#[derive(Default)]
+struct LocationRangeUnitIter<'ctx> {
+    lines: Option<&'ctx Lines>,
+    seqs: &'ctx [LineSequence],
+    seq_idx: usize,
+    row_idx: usize,
+    probe_high: u64,
+}
+
+impl<'ctx> LocationRangeUnitIter<'ctx> {
+    fn new<R: gimli::Reader>(
+        resunit: &'ctx ResUnit<R>,
+        sections: &gimli::Dwarf<R>,
+        probe_low: u64,
+        probe_high: u64,
+    ) -> Result<Self, Error> {
+        let lines = resunit.parse_lines(sections)?;
+
+        let iter = if let Some(lines) = lines {
+            // Find index for probe_low.
+            let seq_idx = lines.sequences.binary_search_by(|sequence| {
+                if probe_low < sequence.start {
+                    Ordering::Greater
+                } else if probe_low >= sequence.end {
+                    Ordering::Less
+                } else {
+                    Ordering::Equal
+                }
+            });
+            let seq_idx = match seq_idx {
+                Ok(x) => x,
+                Err(0) => 0, // probe below sequence, but range could overlap
+                Err(_) => lines.sequences.len(),
+            };
+
+            let row_idx = if let Some(seq) = lines.sequences.get(seq_idx) {
+                let idx = seq.rows.binary_search_by(|row| row.address.cmp(&probe_low));
+                let idx = match idx {
+                    Ok(x) => x,
+                    Err(0) => 0, // probe below sequence, but range could overlap
+                    Err(x) => x - 1,
+                };
+                idx
+            } else {
+                0
+            };
+
+            Self {
+                lines: Some(lines),
+                seqs: &*lines.sequences,
+                seq_idx,
+                row_idx,
+                probe_high,
+            }
+        } else {
+            Self::default()
+        };
+
+        Ok(iter)
+    }
+}
+
+impl<'ctx> Iterator for LocationRangeUnitIter<'ctx> {
+    type Item = (u64, u64, Location<'ctx>);
+
+    fn next(&mut self) -> Option<(u64, u64, Location<'ctx>)> {
+        loop {
+            let seq = match self.seqs.get(self.seq_idx) {
+                Some(seq) => seq,
+                None => break,
+            };
+
+            if seq.start >= self.probe_high {
+                break;
+            }
+
+            match seq.rows.get(self.row_idx) {
+                Some(row) => {
+                    if row.address >= self.probe_high {
+                        break;
+                    }
+
+                    let file = self
+                        .lines
+                        .unwrap() // must have lines to get this far
+                        .files
+                        .get(row.file_index as usize)
+                        .map(String::as_str);
+                    let nextaddr = seq
+                        .rows
+                        .get(self.row_idx + 1)
+                        .map(|row| row.address)
+                        .unwrap_or(seq.end);
+
+                    let item = (
+                        row.address,
+                        nextaddr - row.address,
+                        Location {
+                            file,
+                            line: if row.line != 0 { Some(row.line) } else { None },
+                            column: if row.column != 0 {
+                                Some(row.column)
+                            } else {
+                                None
+                            },
+                        },
+                    );
+                    self.row_idx += 1;
+
+                    return Some(item);
+                }
+                None => {
+                    self.seq_idx += 1;
+                    self.row_idx = 0;
+                }
+            }
+        }
+        None
     }
 }
 
