@@ -355,13 +355,12 @@ impl<R: gimli::Reader> Context<R> {
 
     /// Find the source file and line corresponding to the given virtual memory address.
     pub fn find_location(&self, probe: u64) -> Result<Option<Location<'_>>, Error> {
-        let sections = &self.sections;
-        let mut unit_iter = self.find_units_range(probe, probe + 1);
-
-        match unit_iter.next() {
-            Some(unit) => unit.find_location(probe, sections),
-            None => Ok(None),
+        for unit in self.find_units(probe) {
+            if let Some(location) = unit.find_location(probe, &self.sections)? {
+                return Ok(Some(location));
+            }
         }
+        Ok(None)
     }
 
     /// Return source file and lines for a range of addresses. For each location it also
@@ -563,10 +562,13 @@ where
         probe: u64,
         sections: &gimli::Dwarf<R>,
     ) -> Result<Option<Location<'_>>, Error> {
-        let mut iter = LocationRangeUnitIter::new(self, sections, probe, probe + 1)?;
-        match iter.next() {
-            None => Ok(None),
-            Some((_addr, _len, loc)) => Ok(Some(loc)),
+        if let Some(mut iter) = LocationRangeUnitIter::new(self, sections, probe, probe + 1)? {
+            match iter.next() {
+                None => Ok(None),
+                Some((_addr, _len, loc)) => Ok(Some(loc)),
+            }
+        } else {
+            Ok(None)
         }
     }
 
@@ -576,7 +578,7 @@ where
         probe_low: u64,
         probe_high: u64,
         sections: &gimli::Dwarf<R>,
-    ) -> Result<LocationRangeUnitIter<'_>, Error> {
+    ) -> Result<Option<LocationRangeUnitIter<'_>>, Error> {
         LocationRangeUnitIter::new(self, sections, probe_low, probe_high)
     }
 
@@ -656,15 +658,10 @@ impl<'ctx, R: gimli::Reader> LocationRangeIter<'ctx, R> {
     #[inline]
     fn new(ctx: &'ctx Context<R>, probe_low: u64, probe_high: u64) -> Result<Self, Error> {
         let sections = &ctx.sections;
-        let mut unit_iter = ctx.find_units_range(probe_low, probe_high);
-        let iter = unit_iter
-            .next()
-            .map(|unit| unit.find_location_range(probe_low, probe_high, sections))
-            .transpose()?;
-
+        let unit_iter = ctx.find_units_range(probe_low, probe_high);
         Ok(Self {
             unit_iter: Box::new(unit_iter),
-            iter,
+            iter: None,
             probe_low,
             probe_high,
             sections,
@@ -675,27 +672,27 @@ impl<'ctx, R: gimli::Reader> LocationRangeIter<'ctx, R> {
         loop {
             let iter = self.iter.take();
             match iter {
-                None => break,
-                Some(mut iter) => match iter.next() {
-                    item @ Some(_) => {
-                        self.iter = Some(iter);
-                        return Ok(item);
-                    }
-                    None => match self.unit_iter.next() {
+                None => {
+                    match self.unit_iter.next() {
                         Some(unit) => {
-                            self.iter = Some(unit.find_location_range(
+                            self.iter = unit.find_location_range(
                                 self.probe_low,
                                 self.probe_high,
                                 self.sections,
-                            )?)
+                            )?;
                         }
-                        None => break,
-                    },
+                        None => return Ok(None),
+                    }
+                }
+                Some(mut iter) => {
+                    let item = iter.next();
+                    if item.is_some() {
+                        self.iter = Some(iter);
+                        return Ok(item);
+                    }
                 },
             }
-            debug_assert!(self.iter.is_some());
         }
-        Ok(None)
     }
 }
 
@@ -728,9 +725,8 @@ where
     }
 }
 
-#[derive(Default)]
 struct LocationRangeUnitIter<'ctx> {
-    lines: Option<&'ctx Lines>,
+    lines: &'ctx Lines,
     seqs: &'ctx [LineSequence],
     seq_idx: usize,
     row_idx: usize,
@@ -743,10 +739,10 @@ impl<'ctx> LocationRangeUnitIter<'ctx> {
         sections: &gimli::Dwarf<R>,
         probe_low: u64,
         probe_high: u64,
-    ) -> Result<Self, Error> {
+    ) -> Result<Option<Self>, Error> {
         let lines = resunit.parse_lines(sections)?;
 
-        let iter = if let Some(lines) = lines {
+        if let Some(lines) = lines {
             // Find index for probe_low.
             let seq_idx = lines.sequences.binary_search_by(|sequence| {
                 if probe_low < sequence.start {
@@ -775,18 +771,16 @@ impl<'ctx> LocationRangeUnitIter<'ctx> {
                 0
             };
 
-            Self {
-                lines: Some(lines),
+            Ok(Some(Self {
+                lines: lines,
                 seqs: &*lines.sequences,
                 seq_idx,
                 row_idx,
                 probe_high,
-            }
+            }))
         } else {
-            Self::default()
-        };
-
-        Ok(iter)
+            Ok(None)
+        }
     }
 }
 
@@ -812,7 +806,6 @@ impl<'ctx> Iterator for LocationRangeUnitIter<'ctx> {
 
                     let file = self
                         .lines
-                        .unwrap() // must have lines to get this far
                         .files
                         .get(row.file_index as usize)
                         .map(String::as_str);
