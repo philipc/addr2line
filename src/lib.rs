@@ -294,6 +294,7 @@ impl<R: gimli::Reader> Context<R> {
     /// Finds the CUs covering the range of addresses given.
     ///
     /// The range is [low, high) (ie, the upper bound is exclusive).
+    #[inline]
     fn find_units_range(
         &self,
         probe_low: u64,
@@ -354,8 +355,13 @@ impl<R: gimli::Reader> Context<R> {
 
     /// Find the source file and line corresponding to the given virtual memory address.
     pub fn find_location(&self, probe: u64) -> Result<Option<Location<'_>>, Error> {
-        self.find_location_range(probe, probe + 1)
-            .map(|mut locs| locs.next().map(|(_, _, loc)| loc))
+        let sections = &self.sections;
+        let mut unit_iter = self.find_units_range(probe, probe + 1);
+
+        match unit_iter.next() {
+            Some(unit) => unit.find_location(probe, sections),
+            None => Ok(None),
+        }
     }
 
     /// Return source file and lines for a range of addresses. For each location it also
@@ -557,10 +563,14 @@ where
         probe: u64,
         sections: &gimli::Dwarf<R>,
     ) -> Result<Option<Location<'_>>, Error> {
-        self.find_location_range(probe, probe + 1, sections)
-            .map(|mut iter| iter.next().map(|(_addr, _len, loc)| loc))
+        let mut iter = LocationRangeUnitIter::new(self, sections, probe, probe + 1)?;
+        match iter.next() {
+            None => Ok(None),
+            Some((_addr, _len, loc)) => Ok(Some(loc)),
+        }
     }
 
+    #[inline]
     fn find_location_range(
         &self,
         probe_low: u64,
@@ -643,6 +653,7 @@ pub struct LocationRangeIter<'ctx, R: gimli::Reader> {
 }
 
 impl<'ctx, R: gimli::Reader> LocationRangeIter<'ctx, R> {
+    #[inline]
     fn new(ctx: &'ctx Context<R>, probe_low: u64, probe_high: u64) -> Result<Self, Error> {
         let sections = &ctx.sections;
         let mut unit_iter = ctx.find_units_range(probe_low, probe_high);
