@@ -330,12 +330,12 @@ impl<R: gimli::Reader> Context<R> {
                 // iterating in reverse so if our probe is beyond the maximum range
                 // of this entry, then it's guaranteed to not fit in any prior
                 // entries, so we break out.
-                probe_low < i.max_end
+                probe_low <= i.max_end
             })
             .filter_map(move |i| {
                 // If this CU doesn't actually contain this address, move to the
                 // next CU.
-                if probe_low > i.range.end || probe_high <= i.range.begin {
+                if probe_low >= i.range.end || probe_high <= i.range.begin {
                     return None;
                 }
                 Some(&self.units[i.unit_id])
