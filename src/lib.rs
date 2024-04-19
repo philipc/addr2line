@@ -49,6 +49,7 @@ use core::u64;
 use crate::function::{Function, Functions, InlinedFunction, LazyFunctions};
 use crate::line::{LazyLines, LineLocationRangeIter, Lines};
 use crate::lookup::{LoopingLookup, SimpleLookup};
+use crate::namespace::{LazyNamespaces, Namespace, NamespaceIter, NamespaceRef, Namespaces};
 use crate::unit::{ResUnit, ResUnits, SupUnits};
 
 #[cfg(feature = "smallvec")]
@@ -75,6 +76,8 @@ mod line;
 
 mod lookup;
 pub use lookup::{LookupContinuation, LookupResult, SplitDwarfLoad};
+
+mod namespace;
 
 mod unit;
 pub use unit::LocationRangeIter;
@@ -229,9 +232,9 @@ impl<R: gimli::Reader> Context<R> {
         impl LookupContinuation<Output = Option<(&gimli::Dwarf<R>, &gimli::Unit<R>)>, Buf = R>,
     > {
         let mut units_iter = self.units.find(probe);
-        if let Some(unit) = units_iter.next() {
+        if let Some((unit_id, unit)) = units_iter.next() {
             return LoopingLookup::new_lookup(
-                unit.find_function_or_location(probe, self),
+                unit.find_function_or_location(probe, self, unit_id),
                 move |r| {
                     ControlFlow::Break(match r {
                         Ok((Some(_), _)) | Ok((_, Some(_))) => {
@@ -243,10 +246,12 @@ impl<R: gimli::Reader> Context<R> {
                             Some((sections, unit))
                         }
                         _ => match units_iter.next() {
-                            Some(next_unit) => {
-                                return ControlFlow::Continue(
-                                    next_unit.find_function_or_location(probe, self),
-                                );
+                            Some((next_unit_id, next_unit)) => {
+                                return ControlFlow::Continue(next_unit.find_function_or_location(
+                                    probe,
+                                    self,
+                                    next_unit_id,
+                                ));
                             }
                             None => None,
                         },
@@ -260,7 +265,7 @@ impl<R: gimli::Reader> Context<R> {
 
     /// Find the source file and line corresponding to the given virtual memory address.
     pub fn find_location(&self, probe: u64) -> Result<Option<Location<'_>>, Error> {
-        for unit in self.units.find(probe) {
+        for (_unit_id, unit) in self.units.find(probe) {
             if let Some(location) = unit.find_location(probe, &self.sections)? {
                 return Ok(Some(location));
             }
@@ -294,31 +299,36 @@ impl<R: gimli::Reader> Context<R> {
     ) -> LookupResult<impl LookupContinuation<Output = Result<FrameIter<'_, R>, Error>, Buf = R>>
     {
         let mut units_iter = self.units.find(probe);
-        if let Some(unit) = units_iter.next() {
-            LoopingLookup::new_lookup(unit.find_function_or_location(probe, self), move |r| {
-                ControlFlow::Break(match r {
-                    Err(e) => Err(e),
-                    Ok((Some(function), location)) => {
-                        let inlined_functions = function.find_inlined_functions(probe);
-                        Ok(FrameIter::new_frames(
-                            unit,
-                            &self.sections,
-                            function,
-                            inlined_functions,
-                            location,
-                        ))
-                    }
-                    Ok((None, Some(location))) => Ok(FrameIter::new_location(location)),
-                    Ok((None, None)) => match units_iter.next() {
-                        Some(next_unit) => {
-                            return ControlFlow::Continue(
-                                next_unit.find_function_or_location(probe, self),
-                            );
+        if let Some((unit_id, unit)) = units_iter.next() {
+            LoopingLookup::new_lookup(
+                unit.find_function_or_location(probe, self, unit_id),
+                move |r| {
+                    ControlFlow::Break(match r {
+                        Err(e) => Err(e),
+                        Ok((Some(function), location)) => {
+                            let inlined_functions = function.find_inlined_functions(probe);
+                            Ok(FrameIter::new_frames(
+                                unit,
+                                &self.sections,
+                                function,
+                                inlined_functions,
+                                location,
+                            ))
                         }
-                        None => Ok(FrameIter::new_empty()),
-                    },
-                })
-            })
+                        Ok((None, Some(location))) => Ok(FrameIter::new_location(location)),
+                        Ok((None, None)) => match units_iter.next() {
+                            Some((next_unit_id, next_unit)) => {
+                                return ControlFlow::Continue(next_unit.find_function_or_location(
+                                    probe,
+                                    self,
+                                    next_unit_id,
+                                ));
+                            }
+                            None => Ok(FrameIter::new_empty()),
+                        },
+                    })
+                },
+            )
         } else {
             LoopingLookup::new_complete(Ok(FrameIter::new_empty()))
         }
@@ -363,7 +373,7 @@ impl<R: gimli::Reader> Context<R> {
     > {
         self.units
             .find(probe)
-            .filter_map(move |unit| match unit.dwarf_and_unit(self) {
+            .filter_map(move |(_unit_id, unit)| match unit.dwarf_and_unit(self) {
                 LookupResult::Output(_) => None,
                 LookupResult::Load { load, continuation } => Some((load, |result| {
                     continuation.resume(result).unwrap().map(|_| ())
@@ -392,8 +402,9 @@ impl<R: gimli::Reader> Context<R> {
     /// Initialize all inlined function data structures. This is used for benchmarks.
     #[doc(hidden)]
     pub fn parse_inlined_functions(&self) -> Result<(), Error> {
-        for unit in self.units.iter() {
-            unit.parse_inlined_functions(self).skip_all_loads()?;
+        for (unit_id, unit) in self.units.iter().enumerate() {
+            unit.parse_inlined_functions(self, unit_id)
+                .skip_all_loads()?;
         }
         Ok(())
     }
@@ -405,8 +416,8 @@ impl<R: gimli::Reader> Context<R> {
         &self,
         offset: gimli::DebugInfoOffset<R::Offset>,
         file: DebugFile,
-    ) -> Result<(&gimli::Unit<R>, gimli::UnitOffset<R::Offset>), Error> {
-        let unit = match file {
+    ) -> Result<(usize, &gimli::Unit<R>, gimli::UnitOffset<R::Offset>), Error> {
+        let (unit_id, unit) = match file {
             DebugFile::Primary => self.units.find_offset(offset)?,
             DebugFile::Supplementary => self.sup_units.find_offset(offset)?,
             DebugFile::Dwo => return Err(gimli::Error::NoEntryAtGivenOffset),
@@ -415,7 +426,18 @@ impl<R: gimli::Reader> Context<R> {
         let unit_offset = offset
             .to_unit_offset(&unit.header)
             .ok_or(gimli::Error::NoEntryAtGivenOffset)?;
-        Ok((unit, unit_offset))
+        Ok((unit_id, unit, unit_offset))
+    }
+
+    /// TODO
+    pub fn find_namespace(
+        &self,
+        namespace: NamespaceRef<R::Offset>,
+    ) -> Result<NamespaceIter<R>, Error> {
+        match namespace.file {
+            DebugFile::Primary | DebugFile::Dwo => self.units.find_namespace(namespace, self),
+            DebugFile::Supplementary => self.sup_units.find_namespace(namespace, self),
+        }
     }
 }
 

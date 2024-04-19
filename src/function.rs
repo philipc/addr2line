@@ -4,7 +4,7 @@ use core::cmp::Ordering;
 
 use crate::lazy::LazyResult;
 use crate::maybe_small;
-use crate::{Context, DebugFile, Error, RangeAttributes};
+use crate::{Context, DebugFile, Error, Namespace, NamespaceRef, Namespaces, RangeAttributes};
 
 pub(crate) struct LazyFunctions<R: gimli::Reader>(LazyResult<Functions<R>>);
 
@@ -26,6 +26,8 @@ impl<R: gimli::Reader> LazyFunctions<R> {
 }
 
 pub(crate) struct Functions<R: gimli::Reader> {
+    /// List of all `DW_TAG_namespace` entries in the unit.
+    pub(crate) namespaces: Namespaces<R>,
     /// List of all `DW_TAG_subprogram` details in the unit.
     pub(crate) functions: Box<[LazyFunction<R>]>,
     /// List of `DW_TAG_subprogram` address ranges in the unit.
@@ -59,12 +61,13 @@ impl<R: gimli::Reader> LazyFunction<R> {
     pub(crate) fn borrow(
         &self,
         file: DebugFile,
+        unit_id: usize,
         unit: &gimli::Unit<R>,
         ctx: &Context<R>,
         sections: &gimli::Dwarf<R>,
     ) -> Result<&Function<R>, Error> {
         self.lazy
-            .borrow_with(|| Function::parse(self.dw_die_offset, file, unit, ctx, sections))
+            .borrow_with(|| Function::parse(self.dw_die_offset, file, unit_id, unit, ctx, sections))
             .as_ref()
             .map_err(Error::clone)
     }
@@ -72,7 +75,11 @@ impl<R: gimli::Reader> LazyFunction<R> {
 
 pub(crate) struct Function<R: gimli::Reader> {
     pub(crate) dw_die_offset: gimli::UnitOffset<R::Offset>,
+    pub(crate) namespace: Option<NamespaceRef<R::Offset>>,
+    /// The `DW_AT_name` attribute of the function.
     pub(crate) name: Option<R>,
+    /// The `DW_AT_linkage_name` or `DW_AT_MIPS_linkage_name` attribute of the function.
+    pub(crate) linkage_name: Option<R>,
     /// List of all `DW_TAG_inlined_subroutine` details in this function.
     inlined_functions: Box<[InlinedFunction<R>]>,
     /// List of `DW_TAG_inlined_subroutine` address ranges in this function.
@@ -88,7 +95,11 @@ pub(crate) struct InlinedFunctionAddress {
 
 pub(crate) struct InlinedFunction<R: gimli::Reader> {
     pub(crate) dw_die_offset: gimli::UnitOffset<R::Offset>,
+    pub(crate) namespace: Option<NamespaceRef<R::Offset>>,
+    /// The `DW_AT_name` attribute of the inlined function.
     pub(crate) name: Option<R>,
+    /// The `DW_AT_linkage_name` or `DW_AT_MIPS_linkage_name` attribute of the inlined function.
+    pub(crate) linkage_name: Option<R>,
     pub(crate) call_file: Option<u64>,
     pub(crate) call_line: u32,
     pub(crate) call_column: u32,
@@ -96,13 +107,32 @@ pub(crate) struct InlinedFunction<R: gimli::Reader> {
 
 impl<R: gimli::Reader> Functions<R> {
     fn parse(unit: &gimli::Unit<R>, sections: &gimli::Dwarf<R>) -> Result<Functions<R>, Error> {
+        let mut namespaces = Vec::new();
         let mut functions = Vec::new();
         let mut addresses = Vec::new();
         let mut entries = unit.entries_raw(None)?;
         while !entries.is_empty() {
+            let depth = entries.next_depth();
             let dw_die_offset = entries.next_offset();
             if let Some(abbrev) = entries.read_abbreviation()? {
-                if abbrev.tag() == gimli::DW_TAG_subprogram {
+                if abbrev.tag() == gimli::DW_TAG_namespace {
+                    for spec in abbrev.attributes() {
+                        match entries.read_attribute(*spec) {
+                            Ok(ref attr) => {
+                                if attr.name() == gimli::DW_AT_name {
+                                    if let Ok(name) = sections.attr_string(unit, attr.value()) {
+                                        namespaces.push(Namespace {
+                                            dw_die_offset,
+                                            name,
+                                            depth,
+                                        });
+                                    }
+                                }
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                } else if abbrev.tag() == gimli::DW_TAG_subprogram {
                     let mut ranges = RangeAttributes::default();
                     for spec in abbrev.attributes() {
                         match entries.read_attribute(*spec) {
@@ -167,6 +197,7 @@ impl<R: gimli::Reader> Functions<R> {
         addresses.sort_by_key(|x| x.range.begin);
 
         Ok(Functions {
+            namespaces: Namespaces::new(namespaces),
             functions: functions.into_boxed_slice(),
             addresses: addresses.into_boxed_slice(),
         })
@@ -189,12 +220,13 @@ impl<R: gimli::Reader> Functions<R> {
     pub(crate) fn parse_inlined_functions(
         &self,
         file: DebugFile,
+        unit_id: usize,
         unit: &gimli::Unit<R>,
         ctx: &Context<R>,
         sections: &gimli::Dwarf<R>,
     ) -> Result<(), Error> {
         for function in &*self.functions {
-            function.borrow(file, unit, ctx, sections)?;
+            function.borrow(file, unit_id, unit, ctx, sections)?;
         }
         Ok(())
     }
@@ -204,6 +236,7 @@ impl<R: gimli::Reader> Function<R> {
     fn parse(
         dw_die_offset: gimli::UnitOffset<R::Offset>,
         file: DebugFile,
+        unit_id: usize,
         unit: &gimli::Unit<R>,
         ctx: &Context<R>,
         sections: &gimli::Dwarf<R>,
@@ -213,24 +246,38 @@ impl<R: gimli::Reader> Function<R> {
         let abbrev = entries.read_abbreviation()?.unwrap();
         debug_assert_eq!(abbrev.tag(), gimli::DW_TAG_subprogram);
 
+        let mut namespace = None;
         let mut name = None;
+        let mut linkage_name = None;
         for spec in abbrev.attributes() {
             match entries.read_attribute(*spec) {
                 Ok(ref attr) => {
                     match attr.name() {
                         gimli::DW_AT_linkage_name | gimli::DW_AT_MIPS_linkage_name => {
                             if let Ok(val) = sections.attr_string(unit, attr.value()) {
-                                name = Some(val);
+                                linkage_name = Some(val);
                             }
                         }
                         gimli::DW_AT_name => {
-                            if name.is_none() {
-                                name = sections.attr_string(unit, attr.value()).ok();
+                            if let Ok(val) = sections.attr_string(unit, attr.value()) {
+                                name = Some(val);
+                                namespace = Some(NamespaceRef::new(file, unit_id, dw_die_offset));
                             }
                         }
                         gimli::DW_AT_abstract_origin | gimli::DW_AT_specification => {
-                            if name.is_none() {
-                                name = name_attr(attr.value(), file, unit, ctx, sections, 16)?;
+                            if linkage_name.is_none() || name.is_none() {
+                                name_attr(
+                                    attr.value(),
+                                    file,
+                                    unit_id,
+                                    unit,
+                                    ctx,
+                                    sections,
+                                    16,
+                                    &mut name,
+                                    &mut linkage_name,
+                                    &mut namespace,
+                                )?;
                             }
                         }
                         _ => {}
@@ -246,6 +293,7 @@ impl<R: gimli::Reader> Function<R> {
             addresses: Vec::new(),
             file,
             unit,
+            unit_id,
             ctx,
             sections,
         };
@@ -277,7 +325,9 @@ impl<R: gimli::Reader> Function<R> {
 
         Ok(Function {
             dw_die_offset,
+            namespace,
             name,
+            linkage_name,
             inlined_functions: state.functions.into_boxed_slice(),
             inlined_addresses: state.addresses.into_boxed_slice(),
         })
@@ -378,10 +428,14 @@ impl<R: gimli::Reader> InlinedFunction<R> {
         depth: isize,
         inlined_depth: usize,
     ) -> Result<(), Error> {
+        let file = state.file;
+        let unit_id = state.unit_id;
         let unit = state.unit;
         let sections = state.sections;
         let mut ranges = RangeAttributes::default();
+        let mut namespace = None;
         let mut name = None;
+        let mut linkage_name = None;
         let mut call_file = None;
         let mut call_line = 0;
         let mut call_column = 0;
@@ -408,18 +462,29 @@ impl<R: gimli::Reader> InlinedFunction<R> {
                     }
                     gimli::DW_AT_linkage_name | gimli::DW_AT_MIPS_linkage_name => {
                         if let Ok(val) = sections.attr_string(unit, attr.value()) {
-                            name = Some(val);
+                            linkage_name = Some(val);
                         }
                     }
                     gimli::DW_AT_name => {
-                        if name.is_none() {
-                            name = sections.attr_string(unit, attr.value()).ok();
+                        if let Ok(val) = sections.attr_string(unit, attr.value()) {
+                            name = Some(val);
+                            namespace = Some(NamespaceRef::new(file, unit_id, dw_die_offset));
                         }
                     }
                     gimli::DW_AT_abstract_origin | gimli::DW_AT_specification => {
-                        if name.is_none() {
-                            name =
-                                name_attr(attr.value(), state.file, unit, state.ctx, sections, 16)?;
+                        if linkage_name.is_none() || name.is_none() {
+                            name_attr(
+                                attr.value(),
+                                file,
+                                unit_id,
+                                unit,
+                                state.ctx,
+                                sections,
+                                16,
+                                &mut name,
+                                &mut linkage_name,
+                                &mut namespace,
+                            )?;
                         }
                     }
                     gimli::DW_AT_call_file => {
@@ -453,7 +518,9 @@ impl<R: gimli::Reader> InlinedFunction<R> {
         let function_index = state.functions.len();
         state.functions.push(InlinedFunction {
             dw_die_offset,
+            namespace,
             name,
+            linkage_name,
             call_file,
             call_line,
             call_column,
@@ -479,6 +546,7 @@ struct InlinedState<'a, R: gimli::Reader> {
 
     // Constant fields.
     file: DebugFile,
+    unit_id: usize,
     unit: &'a gimli::Unit<R>,
     ctx: &'a Context<R>,
     sections: &'a gimli::Dwarf<R>,
@@ -487,47 +555,87 @@ struct InlinedState<'a, R: gimli::Reader> {
 fn name_attr<R>(
     attr: gimli::AttributeValue<R>,
     mut file: DebugFile,
+    unit_id: usize,
     unit: &gimli::Unit<R>,
     ctx: &Context<R>,
     sections: &gimli::Dwarf<R>,
-    recursion_limit: usize,
-) -> Result<Option<R>, Error>
+    mut recursion_limit: usize,
+    name: &mut Option<R>,
+    linkage_name: &mut Option<R>,
+    namespace: &mut Option<NamespaceRef<R::Offset>>,
+) -> Result<(), Error>
 where
     R: gimli::Reader,
 {
     if recursion_limit == 0 {
-        return Ok(None);
+        return Ok(());
     }
+    recursion_limit -= 1;
 
     match attr {
-        gimli::AttributeValue::UnitRef(offset) => {
-            name_entry(file, unit, offset, ctx, sections, recursion_limit)
-        }
+        gimli::AttributeValue::UnitRef(offset) => name_entry(
+            file,
+            unit_id,
+            unit,
+            offset,
+            ctx,
+            sections,
+            recursion_limit,
+            name,
+            linkage_name,
+            namespace,
+        ),
         gimli::AttributeValue::DebugInfoRef(dr) => {
-            let (unit, offset) = ctx.find_unit(dr, file)?;
-            name_entry(file, unit, offset, ctx, sections, recursion_limit)
+            let (unit_id, unit, offset) = ctx.find_unit(dr, file)?;
+            name_entry(
+                file,
+                unit_id,
+                unit,
+                offset,
+                ctx,
+                sections,
+                recursion_limit,
+                name,
+                linkage_name,
+                namespace,
+            )
         }
         gimli::AttributeValue::DebugInfoRefSup(dr) => {
             if let Some(sup_sections) = sections.sup.as_ref() {
                 file = DebugFile::Supplementary;
-                let (unit, offset) = ctx.find_unit(dr, file)?;
-                name_entry(file, unit, offset, ctx, sup_sections, recursion_limit)
+                let (unit_id, unit, offset) = ctx.find_unit(dr, file)?;
+                name_entry(
+                    file,
+                    unit_id,
+                    unit,
+                    offset,
+                    ctx,
+                    sup_sections,
+                    recursion_limit,
+                    name,
+                    linkage_name,
+                    namespace,
+                )
             } else {
-                Ok(None)
+                Ok(())
             }
         }
-        _ => Ok(None),
+        _ => Ok(()),
     }
 }
 
 fn name_entry<R>(
     file: DebugFile,
+    unit_id: usize,
     unit: &gimli::Unit<R>,
     offset: gimli::UnitOffset<R::Offset>,
     ctx: &Context<R>,
     sections: &gimli::Dwarf<R>,
     recursion_limit: usize,
-) -> Result<Option<R>, Error>
+    name: &mut Option<R>,
+    linkage_name: &mut Option<R>,
+    namespace: &mut Option<NamespaceRef<R::Offset>>,
+) -> Result<(), Error>
 where
     R: gimli::Reader,
 {
@@ -538,19 +646,19 @@ where
         return Err(gimli::Error::NoEntryAtGivenOffset);
     };
 
-    let mut name = None;
     let mut next = None;
     for spec in abbrev.attributes() {
         match entries.read_attribute(*spec) {
             Ok(ref attr) => match attr.name() {
                 gimli::DW_AT_linkage_name | gimli::DW_AT_MIPS_linkage_name => {
                     if let Ok(val) = sections.attr_string(unit, attr.value()) {
-                        return Ok(Some(val));
+                        *linkage_name = Some(val);
                     }
                 }
                 gimli::DW_AT_name => {
                     if let Ok(val) = sections.attr_string(unit, attr.value()) {
-                        name = Some(val);
+                        *name = Some(val);
+                        *namespace = Some(NamespaceRef::new(file, unit_id, offset));
                     }
                 }
                 gimli::DW_AT_abstract_origin | gimli::DW_AT_specification => {
@@ -562,13 +670,24 @@ where
         }
     }
 
-    if name.is_some() {
-        return Ok(name);
+    if name.is_some() && linkage_name.is_some() {
+        return Ok(());
     }
 
     if let Some(next) = next {
-        return name_attr(next, file, unit, ctx, sections, recursion_limit - 1);
+        return name_attr(
+            next,
+            file,
+            unit_id,
+            unit,
+            ctx,
+            sections,
+            recursion_limit,
+            name,
+            linkage_name,
+            namespace,
+        );
     }
 
-    Ok(None)
+    Ok(())
 }

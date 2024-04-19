@@ -2,7 +2,7 @@ use alloc::borrow::Cow;
 use alloc::string::String;
 use core::iter;
 
-use crate::{maybe_small, Error, Function, InlinedFunction, ResUnit};
+use crate::{maybe_small, Error, Function, InlinedFunction, NamespaceRef, ResUnit};
 
 /// A source location.
 pub struct Location<'a> {
@@ -24,6 +24,10 @@ pub struct Frame<'ctx, R: gimli::Reader> {
     pub function: Option<FunctionName<R>>,
     /// The source location corresponding to this frame.
     pub location: Option<Location<'ctx>>,
+    /// TODO
+    pub namespace: Option<NamespaceRef<R::Offset>>,
+    /// TODO
+    pub name: Option<R>,
 }
 
 /// An iterator over function frames.
@@ -92,6 +96,8 @@ where
                     dw_die_offset: None,
                     function: None,
                     location,
+                    namespace: None,
+                    name: None,
                 }));
             }
             FrameIterState::Frames(frames) => frames,
@@ -103,11 +109,17 @@ where
             None => {
                 let frame = Frame {
                     dw_die_offset: Some(frames.function.dw_die_offset),
-                    function: frames.function.name.clone().map(|name| FunctionName {
-                        name,
-                        language: frames.unit.lang,
-                    }),
+                    function: frames
+                        .function
+                        .linkage_name
+                        .clone()
+                        .map(|name| FunctionName {
+                            name,
+                            language: frames.unit.lang,
+                        }),
                     location: loc,
+                    namespace: frames.function.namespace,
+                    name: frames.function.name.clone(),
                 };
                 self.0 = FrameIterState::Empty;
                 return Ok(Some(frame));
@@ -136,11 +148,13 @@ where
 
         Ok(Some(Frame {
             dw_die_offset: Some(func.dw_die_offset),
-            function: func.name.clone().map(|name| FunctionName {
+            function: func.linkage_name.clone().map(|name| FunctionName {
                 name,
                 language: frames.unit.lang,
             }),
             location: loc,
+            namespace: func.namespace,
+            name: func.name.clone(),
         }))
     }
 }

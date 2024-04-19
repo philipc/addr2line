@@ -5,9 +5,9 @@ use core::cmp;
 
 use crate::lazy::LazyResult;
 use crate::{
-    Context, DebugFile, Error, Function, Functions, LazyFunctions, LazyLines,
-    LineLocationRangeIter, Lines, Location, LookupContinuation, LookupResult, RangeAttributes,
-    SimpleLookup, SplitDwarfLoad,
+    Context, DebugFile, Error, Function, Functions, LazyFunctions, LazyLines, LazyNamespaces,
+    LineLocationRangeIter, Lines, Location, LookupContinuation, LookupResult, NamespaceIter,
+    NamespaceRef, RangeAttributes, SimpleLookup, SplitDwarfLoad,
 };
 
 pub(crate) struct UnitRange {
@@ -130,12 +130,13 @@ impl<R: gimli::Reader> ResUnit<R> {
     pub(crate) fn parse_inlined_functions<'unit, 'ctx: 'unit>(
         &'unit self,
         ctx: &'ctx Context<R>,
+        unit_id: usize,
     ) -> LookupResult<impl LookupContinuation<Output = Result<(), Error>, Buf = R> + 'unit> {
         self.dwarf_and_unit(ctx).map(move |r| {
             let (file, sections, unit) = r?;
             self.functions
                 .borrow(unit, sections)?
-                .parse_inlined_functions(file, unit, ctx, sections)
+                .parse_inlined_functions(file, unit_id, unit, ctx, sections)
         })
     }
 
@@ -171,6 +172,7 @@ impl<R: gimli::Reader> ResUnit<R> {
         &'unit self,
         probe: u64,
         ctx: &'ctx Context<R>,
+        unit_id: usize,
     ) -> LookupResult<
         impl LookupContinuation<
             Output = Result<(Option<&'unit Function<R>>, Option<Location<'unit>>), Error>,
@@ -184,7 +186,7 @@ impl<R: gimli::Reader> ResUnit<R> {
                 Some(address) => {
                     let function_index = functions.addresses[address].function;
                     let function = &functions.functions[function_index];
-                    Some(function.borrow(file, unit, ctx, sections)?)
+                    Some(function.borrow(file, unit_id, unit, ctx, sections)?)
                 }
                 None => None,
             };
@@ -372,15 +374,28 @@ impl<R: gimli::Reader> ResUnits<R> {
     pub(crate) fn find_offset(
         &self,
         offset: gimli::DebugInfoOffset<R::Offset>,
-    ) -> Result<&gimli::Unit<R>, Error> {
+    ) -> Result<(usize, &gimli::Unit<R>), Error> {
         match self
             .units
             .binary_search_by_key(&offset.0, |unit| unit.offset.0)
         {
             // There is never a DIE at the unit offset or before the first unit.
             Ok(_) | Err(0) => Err(gimli::Error::NoEntryAtGivenOffset),
-            Err(i) => Ok(&self.units[i - 1].dw_unit),
+            Err(i) => Ok((i - 1, &self.units[i - 1].dw_unit)),
         }
+    }
+
+    pub(crate) fn find_namespace(
+        &self,
+        namespace: NamespaceRef<R::Offset>,
+        ctx: &Context<R>,
+    ) -> Result<NamespaceIter<R>, Error> {
+        let unit = self.units.get(namespace.unit_index).unwrap();
+        let (file, sections, dw_unit) = unit.dwarf_and_unit(ctx).unwrap().unwrap();
+        assert_eq!(file, namespace.file);
+        let functions = unit.functions.borrow(&dw_unit, sections)?;
+        let namespaces = &functions.namespaces;
+        namespaces.find(namespace.dw_die_offset)
     }
 
     /// Finds the CUs for the function address given.
@@ -393,8 +408,9 @@ impl<R: gimli::Reader> ResUnits<R> {
     /// Consequently we return an iterator for all CUs which may contain the
     /// address, and the caller must check if there is actually a function or
     /// location in the CU for that address.
-    pub(crate) fn find(&self, probe: u64) -> impl Iterator<Item = &ResUnit<R>> {
-        self.find_range(probe, probe + 1).map(|(unit, _range)| unit)
+    pub(crate) fn find(&self, probe: u64) -> impl Iterator<Item = (usize, &ResUnit<R>)> {
+        self.find_range(probe, probe + 1)
+            .map(|(unit_id, unit, _range)| (unit_id, unit))
     }
 
     /// Finds the CUs covering the range of addresses given.
@@ -406,7 +422,7 @@ impl<R: gimli::Reader> ResUnits<R> {
         &self,
         probe_low: u64,
         probe_high: u64,
-    ) -> impl Iterator<Item = (&ResUnit<R>, &gimli::Range)> {
+    ) -> impl Iterator<Item = (usize, &ResUnit<R>, &gimli::Range)> {
         // First up find the position in the array which could have our function
         // address.
         let pos = match self
@@ -445,7 +461,7 @@ impl<R: gimli::Reader> ResUnits<R> {
                 if probe_low >= i.range.end || probe_high <= i.range.begin {
                     return None;
                 }
-                Some((&self.units[i.unit_id], &i.range))
+                Some((i.unit_id, &self.units[i.unit_id], &i.range))
             })
     }
 
@@ -475,6 +491,7 @@ struct DwoUnit<R: gimli::Reader> {
 pub(crate) struct SupUnit<R: gimli::Reader> {
     offset: gimli::DebugInfoOffset<R::Offset>,
     dw_unit: gimli::Unit<R>,
+    namespaces: LazyNamespaces<R>,
 }
 
 pub(crate) struct SupUnits<R: gimli::Reader> {
@@ -502,7 +519,11 @@ impl<R: gimli::Reader> SupUnits<R> {
                 Ok(dw_unit) => dw_unit,
                 Err(_) => continue,
             };
-            sup_units.push(SupUnit { dw_unit, offset });
+            sup_units.push(SupUnit {
+                dw_unit,
+                offset,
+                namespaces: LazyNamespaces::new(),
+            });
         }
         Ok(SupUnits {
             units: sup_units.into_boxed_slice(),
@@ -512,21 +533,32 @@ impl<R: gimli::Reader> SupUnits<R> {
     pub(crate) fn find_offset(
         &self,
         offset: gimli::DebugInfoOffset<R::Offset>,
-    ) -> Result<&gimli::Unit<R>, Error> {
+    ) -> Result<(usize, &gimli::Unit<R>), Error> {
         match self
             .units
             .binary_search_by_key(&offset.0, |unit| unit.offset.0)
         {
             // There is never a DIE at the unit offset or before the first unit.
             Ok(_) | Err(0) => Err(gimli::Error::NoEntryAtGivenOffset),
-            Err(i) => Ok(&self.units[i - 1].dw_unit),
+            Err(i) => Ok((i, &self.units[i - 1].dw_unit)),
         }
+    }
+
+    pub(crate) fn find_namespace(
+        &self,
+        namespace: NamespaceRef<R::Offset>,
+        ctx: &Context<R>,
+    ) -> Result<NamespaceIter<R>, Error> {
+        let unit = self.units.get(namespace.unit_index).unwrap();
+        let sections = ctx.sections.sup.as_ref().unwrap();
+        let namespaces = unit.namespaces.borrow(&unit.dw_unit, sections)?;
+        namespaces.find(namespace.dw_die_offset)
     }
 }
 
 /// Iterator over `Location`s in a range of addresses, returned by `Context::find_location_range`.
 pub struct LocationRangeIter<'ctx, R: gimli::Reader> {
-    unit_iter: Box<dyn Iterator<Item = (&'ctx ResUnit<R>, &'ctx gimli::Range)> + 'ctx>,
+    unit_iter: Box<dyn Iterator<Item = (usize, &'ctx ResUnit<R>, &'ctx gimli::Range)> + 'ctx>,
     iter: Option<LineLocationRangeIter<'ctx>>,
 
     probe_low: u64,
@@ -540,7 +572,7 @@ impl<'ctx, R: gimli::Reader> LocationRangeIter<'ctx, R> {
             let iter = self.iter.take();
             match iter {
                 None => match self.unit_iter.next() {
-                    Some((unit, range)) => {
+                    Some((_unit_id, unit, range)) => {
                         self.iter = unit.find_location_range(
                             cmp::max(self.probe_low, range.begin),
                             cmp::min(self.probe_high, range.end),

@@ -262,7 +262,17 @@ fn main() {
                     }
 
                     if opts.do_functions {
-                        if let Some(func) = frame.function {
+                        if let (Some(name), Some(namespace)) = (frame.name, frame.namespace) {
+                            let mut namespace = ctx.find_namespace(namespace).unwrap();
+                            let mut ns = Vec::new();
+                            while let Some(n) = namespace.next() {
+                                ns.push(n);
+                            }
+                            for n in ns.iter().rev() {
+                                print!("{}::", n);
+                            }
+                            print!("{}", name.to_string_lossy());
+                        } else if let Some(func) = frame.function {
                             print_function(
                                 func.raw_name().ok().as_ref().map(AsRef::as_ref),
                                 func.language,
